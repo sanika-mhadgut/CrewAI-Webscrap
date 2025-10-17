@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  app:
+    build: .
+    image: crewai-web-scraper:latest
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+    restart: unless-stopped
