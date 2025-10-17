@@ -1,0 +1,5 @@
+streamlit==1.38.0
+openai>=1.43.0
+beautifulsoup4>=4.12.3
+requests>=2.32.3
+python-dotenv>=1.0.1
