@@ -1,28 +1,181 @@
 import os
+import re
 import textwrap
+from typing import Tuple
+
 import streamlit as st
-from agent import WebScraperCrewAgent
+import requests
+from bs4 import BeautifulSoup
+from openai import OpenAI
+from langfuse import Langfuse
 
+# Constants
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+import os
+
+print("Langfuse Host:", os.getenv("LANGFUSE_HOST"))
+print("Public Key:", os.getenv("LANGFUSE_PUBLIC_KEY"))
+print("Secret Key exists:", bool(os.getenv("LANGFUSE_SECRET_KEY")))
+
+# --------------------- AGENT CLASS ---------------------
+class WebScraperCrewAgent:
+    """Scrapes public web pages and summarizes content using OpenAI, logs to Langfuse."""
+
+    def __init__(self, model: str | None = None):
+        api_key = os.getenv(OPENAI_API_KEY_ENV)
+        if not api_key:
+            raise RuntimeError(f"Missing {OPENAI_API_KEY_ENV}. Set it in environment or sidebar.")
+
+        # OpenAI setup
+        self.client = OpenAI(api_key=api_key)
+        self.model = model or DEFAULT_MODEL
+
+        # Initialize Langfuse (new API)
+        try:
+            self.langfuse = Langfuse()
+            print("✅ Langfuse initialized successfully")
+
+            # Minimal test span to verify connectivity
+            with self.langfuse.start_as_current_span(name="startup-test-span", metadata={"phase": "startup"}):
+                print("🌐 Testing Langfuse connectivity...")
+
+            self.langfuse.flush()
+            print("✅ Langfuse startup test span sent")
+        except Exception as e:
+            print(f"⚠️ Langfuse initialization failed: {e}")
+            self.langfuse = None
+
+    def _extract_first_url(self, text: str) -> str | None:
+        urls = re.findall(r"https?://\S+", text)
+        return urls[0] if urls else None
+
+    def scrape_website(self, url: str, timeout_seconds: int = 15) -> str:
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                )
+            }
+            resp = requests.get(url, timeout=timeout_seconds, headers=headers)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Remove noise
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+
+            paragraphs = [p.get_text(" ").strip() for p in soup.find_all("p")]
+            text = " ".join(p for p in paragraphs if p)
+            return text[:8000]
+        except Exception as exc:
+            return f"Error scraping website: {exc}"
+
+    def summarize_content(self, text: str, query: str, url: str | None = None) -> str:
+        """Summarize content using OpenAI and log the generation to Langfuse."""
+        system_prompt = (
+            "You are a precise web analyst. Use only the provided content. "
+            "If information is missing, say so clearly. Keep answers concise."
+        )
+        user_prompt = (
+            f"Below is content scraped from a public website.\n\n"
+            f"Content:\n{text}\n\n"
+            f"User question:\n{query}\n\n"
+            "Provide a clear, factual, carefully structured answer."
+        )
+
+        if self.langfuse:
+            # Start generation span
+            with self.langfuse.start_as_current_generation(
+                name="summarize_content",
+                input={"system": system_prompt, "user": user_prompt},
+                metadata={"url": url},
+                model=self.model,
+            ) as gen:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                )
+                summary = response.choices[0].message.content
+                gen.output = summary
+                print("✅ Logged summarize_content generation to Langfuse")
+        else:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+            )
+            summary = response.choices[0].message.content
+
+        return summary
+
+    def respond(self, user_input: str) -> Tuple[str, str, str]:
+        """Main workflow: extract URL, scrape, summarize, and log to Langfuse."""
+        url = self._extract_first_url(user_input)
+        if not url:
+            return ("", "", "Please provide a valid website URL in your query.")
+
+        scraped, summary = "", ""
+        if self.langfuse:
+            # Root trace (span)
+            with self.langfuse.start_as_current_span(
+                name="web-scraper-respond",
+                metadata={"query": user_input, "url": url},
+            ):
+                # Scrape website
+                with self.langfuse.start_as_current_span(
+                    name="scrape_website",
+                    metadata={"url": url},
+                ):
+                    scraped = self.scrape_website(url)
+                    print("✅ Logged scrape_website span to Langfuse")
+
+                # Summarize
+                summary = self.summarize_content(scraped, user_input, url=url)
+                print("✅ Logged summarize_content generation to Langfuse")
+
+            self.langfuse.flush()
+        else:
+            scraped = self.scrape_website(url)
+            summary = self.summarize_content(scraped, user_input, url=url)
+
+        return (url, scraped, summary)
+
+
+# --------------------- STREAMLIT FRONTEND ---------------------
 st.set_page_config(page_title="CrewAI Web Scraper", page_icon="🤖", layout="wide")
-
 st.title("🤖 CrewAI Web Scraper & Summarizer")
-st.caption("Enter a URL and a question. The agent will scrape and summarize.")
+st.caption("Enter a URL and a question. The agent will scrape and summarize content.")
 
 with st.sidebar:
     st.header("Settings")
-    api_key = st.text_input("OpenAI API Key", value=os.getenv("OPENAI_API_KEY", ""), type="password")
-    model = st.text_input("Model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    api_key = st.text_input(
+        "OpenAI API Key",
+        value=os.getenv("OPENAI_API_KEY", ""),
+        type="password",
+    )
+    model = st.text_input(
+        "Model",
+        value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    )
     st.markdown("Note: API key is used only client-side to initialize the agent.")
 
 query = st.text_area(
     "Your prompt (include at least one https:// URL)",
     height=120,
-    placeholder="Summarize the key points from https://www.bbc.com/news/technology",
+    placeholder="Example: Summarize the key points from https://www.bbc.com/news/technology",
 )
 
-run = st.button("Run Agent", type="primary")
-
-if run:
+if st.button("Run Agent", type="primary"):
     if not api_key:
         st.error("Please provide your OpenAI API key.")
         st.stop()
@@ -55,9 +208,9 @@ st.markdown("---")
 st.markdown(
     textwrap.dedent(
         """
-        Tips:
-        - Provide a full URL beginning with https://
-        - Add a specific question to focus the summary
+        **Tips:**
+        - Provide a full URL beginning with https://  
+        - Add a specific question to focus the summary  
         - Content is truncated to avoid exceeding token limits
         """
     )

@@ -18,6 +18,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
+# ✅ Upgrade Langfuse before copying source or setting CMD
+RUN pip install --upgrade "langfuse>=3.7.0"
+
 # Copy source
 COPY app ./app
 COPY README.md ./

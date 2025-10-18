@@ -1,36 +1,50 @@
 import os
 import re
+import textwrap
 from typing import Tuple
 
+import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 from langfuse import Langfuse
 
 
+# Constants
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 class WebScraperCrewAgent:
-    """Scrapes public web pages and summarizes content using OpenAI."""
+    """Scrapes public web pages and summarizes content using OpenAI, logs to Langfuse."""
 
     def __init__(self, model: str | None = None):
         api_key = os.getenv(OPENAI_API_KEY_ENV)
         if not api_key:
             raise RuntimeError(
-                f"Missing {OPENAI_API_KEY_ENV}. Set it in environment or .env file."
+                f"Missing {OPENAI_API_KEY_ENV}. Set it in environment or sidebar."
             )
-        # OpenAI client used for summarization
+
+        # OpenAI setup
         self.client = OpenAI(api_key=api_key)
         self.model = model or DEFAULT_MODEL
 
-        # Initialize Langfuse for observability if configured
-        # LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST are read from env
+        # Initialize Langfuse
+        self.langfuse = None
         try:
             self.langfuse = Langfuse()
-        except Exception:
-            # If Langfuse is misconfigured, continue without telemetry
+            print("✅ Langfuse initialized successfully")
+
+            # Create a simple test trace at startup (to confirm connection)
+            test_trace = self.langfuse.trace(
+                name="startup-test-trace",
+                input="docker container startup",
+                output="langfuse connection verified",
+                tags=["init", "connectivity-check"],
+            )
+            print("✅ Langfuse startup test trace sent")
+        except Exception as e:
+            print(f"⚠️ Langfuse initialization failed: {e}")
             self.langfuse = None
 
     def _extract_first_url(self, text: str) -> str | None:
@@ -55,8 +69,7 @@ class WebScraperCrewAgent:
 
             paragraphs = [p.get_text(" ").strip() for p in soup.find_all("p")]
             text = " ".join(p for p in paragraphs if p)
-            # Hard cap to avoid overlong prompts
-            return text[:8000]
+            return text[:8000]  # truncate to avoid long inputs
         except Exception as exc:
             return f"Error scraping website: {exc}"
 
@@ -66,11 +79,12 @@ class WebScraperCrewAgent:
             "If information is missing, say so clearly. Keep answers concise."
         )
         user_prompt = (
-            "Below is content scraped from a public website.\n\n"
+            f"Below is content scraped from a public website.\n\n"
             f"Content:\n{text}\n\n"
             f"User question:\n{query}\n\n"
             "Provide a clear, factual, carefully structured answer."
         )
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -81,35 +95,28 @@ class WebScraperCrewAgent:
         )
         summary = response.choices[0].message.content
 
-        # Record LLM generation in Langfuse if available
+        # Log generation to Langfuse
         if self.langfuse and trace is not None:
             try:
                 trace.generation(
                     name="summarize_content",
                     model=self.model,
-                    input={
-                        "system": system_prompt,
-                        "user": user_prompt,
-                    },
+                    input={"system": system_prompt, "user": user_prompt},
                     output=summary,
                     metadata={"temperature": 0.2, "url": url},
                 )
-            except Exception:
-                # Do not let telemetry failures affect user flow
-                pass
+                print("✅ Logged summarize_content generation to Langfuse")
+            except Exception as e:
+                print(f"⚠️ Failed to log generation to Langfuse: {e}")
 
         return summary
 
     def respond(self, user_input: str) -> Tuple[str, str, str]:
-        """
-        Process user input, scrape, and summarize.
-        Returns: (url, scraped_text, summary)
-        """
+        """Main workflow: extract URL, scrape, summarize, and log to Langfuse."""
         url = self._extract_first_url(user_input)
         if not url:
             return ("", "", "Please provide a valid website URL in your query.")
 
-        # Create a Langfuse trace for this agent run if available
         trace = None
         if self.langfuse:
             try:
@@ -118,27 +125,83 @@ class WebScraperCrewAgent:
                     input={"query": user_input, "url": url},
                     tags=["web-scraper", "crewai-agent"],
                 )
-            except Exception:
+                print("✅ Created Langfuse trace for web-scraper-respond")
+            except Exception as e:
+                print(f"⚠️ Failed to create Langfuse trace: {e}")
                 trace = None
 
-        # Scrape inside a span
-        if trace is not None:
-            try:
-                scrape_span = trace.span(name="scrape_website", input={"url": url})
-            except Exception:
-                scrape_span = None
-        else:
-            scrape_span = None
-
+        # Scrape website
         scraped = self.scrape_website(url)
-
-        if scrape_span is not None:
+        if trace:
             try:
-                # Avoid sending the entire content; log size instead
-                scrape_span.end(output={"characters": len(scraped)})
-            except Exception:
-                pass
+                trace.span(name="scrape_website", input={"url": url}).end(
+                    output={"characters": len(scraped)}
+                )
+                print("✅ Logged scrape_website span to Langfuse")
+            except Exception as e:
+                print(f"⚠️ Failed to log scrape span: {e}")
 
+        # Summarize
         summary = self.summarize_content(scraped, user_input, trace=trace, url=url)
-
         return (url, scraped, summary)
+
+
+# ---------------- STREAMLIT FRONTEND ----------------
+
+# st.set_page_config(page_title="CrewAI Web Scraper", page_icon="🤖", layout="wide")
+st.title("🤖 CrewAI Web Scraper & Summarizer")
+st.caption("Enter a URL and a question. The agent will scrape and summarize content.")
+
+with st.sidebar:
+    st.header("Settings")
+    api_key = st.text_input("OpenAI API Key", value=os.getenv("OPENAI_API_KEY", ""), type="password")
+    model = st.text_input("Model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    st.markdown("Note: API key is used only client-side to initialize the agent.")
+
+query = st.text_area(
+    "Your prompt (include at least one https:// URL)",
+    height=120,
+    placeholder="Example: Summarize the key points from https://www.bbc.com/news/technology",
+)
+
+if st.button("Run Agent", type="primary"):
+    if not api_key:
+        st.error("Please provide your OpenAI API key.")
+        st.stop()
+
+    os.environ["OPENAI_API_KEY"] = api_key
+    os.environ["OPENAI_MODEL"] = model
+
+    try:
+        agent = WebScraperCrewAgent(model=model)
+    except Exception as exc:
+        st.error(f"Failed to init agent: {exc}")
+        st.stop()
+
+    with st.spinner("Scraping and summarizing..."):
+        url, scraped, summary = agent.respond(query)
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("URL")
+        st.write(url or "(none)")
+        st.subheader("Scraped Content (truncated)")
+        st.code(scraped or "(no content)", language="markdown")
+
+    with col2:
+        st.subheader("Answer")
+        st.write(summary)
+
+st.markdown("---")
+st.markdown(
+    textwrap.dedent(
+        """
+        Tips:
+        - Provide a full URL beginning with https://
+        - Add a specific question to focus the summary
+        - Content is truncated to avoid exceeding token limits
+        """
+    )
+)
+
