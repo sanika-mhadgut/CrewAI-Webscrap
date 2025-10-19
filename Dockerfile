@@ -28,7 +28,8 @@ COPY README.md ./
 # Default env (can be overridden at runtime)
 ENV OPENAI_MODEL=gpt-4o-mini
 
-EXPOSE 8501
+EXPOSE 80
 
 # Use streamlit to run the app
-CMD ["streamlit", "run", "app/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+CMD ["streamlit", "run", "app/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=80", "--browser.gatherUsageStats=false"]
+
