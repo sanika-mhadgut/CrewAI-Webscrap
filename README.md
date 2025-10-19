@@ -18,32 +18,32 @@ az login
 
 az group create --name crewai-rg --location "Central US"
 
-# Create ACR (use a unique name)
+### Create ACR (use a unique name)
 az acr create --resource-group crewai-rg --name crewaiacrsm --sku Basic
 
-# Enable admin access (required for Azure Web App to pull images)
+### Enable admin access (required for Azure Web App to pull images)
 az acr update -n crewaiacrsm --admin-enabled true
 
 cd Desktop/CrewAI-Webscrap
 
-# Build for Azure’s platform and push directly to ACR
+### Build for Azure’s platform and push directly to ACR
 docker buildx build --platform linux/amd64 -t crewaiacrsm.azurecr.io/crewai-streamlit-app:v8 --push .
 
-# Create an App Service Plan (Linux)
+### Create an App Service Plan (Linux)
 az appservice plan create \
   --name crewai-plan \
   --resource-group crewai-rg \
   --sku B1 \
   --is-linux
 
-# Create the Web App with Docker container
+### Create the Web App with Docker container
 az webapp create \
   --resource-group crewai-rg \
   --plan crewai-plan \
   --name crewai-streamlit-app \
   --deployment-container-image-name crewaiacrsm.azurecr.io/crewai-streamlit-app:v1
 
-# Configure container registry credentials
+### Configure container registry credentials
 az webapp config container set \
   --name crewai-streamlit-app \
   --resource-group crewai-rg \
@@ -52,7 +52,7 @@ az webapp config container set \
   --container-registry-user $(az acr credential show -n crewaiacrsm --query "username" -o tsv) \
   --container-registry-password $(az acr credential show -n crewaiacrsm --query "passwords[0].value" -o tsv)
 
-# Set environment variables (app secrets, keys, etc.)
+### Set environment variables (app secrets, keys, etc.)
 az webapp config appsettings set \
   --resource-group crewai-rg \
   --name crewai-streamlit-app \
