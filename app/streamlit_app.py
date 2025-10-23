@@ -40,9 +40,11 @@ class WebScraperCrewAgent:
             self.langfuse = Langfuse()
             print("✅ Langfuse initialized successfully")
 
-            # Minimal test span to verify connectivity
-            with self.langfuse.start_as_current_span(name="startup-test-span", metadata={"phase": "startup"}):
+            # Minimal test span to verify connectivity with explicit input/output
+            with self.langfuse.start_as_current_span(name="startup-test-span") as test_span:
+                test_span.input = {"phase": "startup", "event": "app_init"}
                 print("🌐 Testing Langfuse connectivity...")
+                test_span.output = {"status": "ok", "message": "langfuse connection verified"}
 
             self.langfuse.flush()
             print("✅ Langfuse startup test span sent")
@@ -145,11 +147,9 @@ class WebScraperCrewAgent:
                 gen.output = answer
                 if CAPTURE_COT and reasoning:
                     # Store reasoning in a dedicated span to avoid mixing with user-visible output
-                    with self.langfuse.start_as_current_span(
-                        name="chain_of_thought",
-                        metadata={"reasoning": reasoning},
-                    ):
-                        pass
+                    with self.langfuse.start_as_current_span(name="chain_of_thought") as cot_span:
+                        cot_span.input = {"purpose": "internal chain-of-thought"}
+                        cot_span.output = {"reasoning": reasoning}
                 return answer
         else:
             answer, _ = _call_openai_and_parse()
@@ -163,21 +163,23 @@ class WebScraperCrewAgent:
 
         scraped, summary = "", ""
         if self.langfuse:
-            # Root trace (span)
+            # Root span with explicit input/output
             with self.langfuse.start_as_current_span(
                 name="web-scraper-respond",
-                metadata={"query": user_input, "url": url},
-            ):
+            ) as root_span:
+                root_span.input = {"query": user_input, "url": url}
                 # Scrape website
                 with self.langfuse.start_as_current_span(
                     name="scrape_website",
-                    metadata={"url": url},
-                ):
+                ) as scrape_span:
+                    scrape_span.input = {"url": url}
                     scraped = self.scrape_website(url)
+                    scrape_span.output = {"characters": len(scraped)}
                     print("✅ Logged scrape_website span to Langfuse")
 
                 # Summarize
                 summary = self.summarize_content(scraped, user_input, url=url)
+                root_span.output = {"summary": summary, "scraped_characters": len(scraped)}
                 print("✅ Logged summarize_content generation to Langfuse")
 
             self.langfuse.flush()
