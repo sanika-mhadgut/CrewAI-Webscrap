@@ -14,7 +14,6 @@ from langfuse import Langfuse
 # Constants
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-# Optional: capture model chain-of-thought in Langfuse only (never shown to users)
 CAPTURE_COT = os.getenv("LANGFUSE_CAPTURE_COT", "false").lower() in ("1", "true", "yes", "on")
 
 
@@ -24,22 +23,16 @@ class WebScraperCrewAgent:
     def __init__(self, model: str | None = None):
         api_key = os.getenv(OPENAI_API_KEY_ENV)
         if not api_key:
-            raise RuntimeError(
-                f"Missing {OPENAI_API_KEY_ENV}. Set it in environment or sidebar."
-            )
+            raise RuntimeError(f"Missing {OPENAI_API_KEY_ENV}. Set it in environment or sidebar.")
 
-        # OpenAI setup
         self.client = OpenAI(api_key=api_key)
         self.model = model or DEFAULT_MODEL
 
         # Initialize Langfuse
-        self.langfuse = None
         try:
             self.langfuse = Langfuse()
             print("✅ Langfuse initialized successfully")
-
-            # Create a simple test trace at startup (to confirm connection)
-            test_trace = self.langfuse.trace(
+            self.langfuse.trace(
                 name="startup-test-trace",
                 input="docker container startup",
                 output="langfuse connection verified",
@@ -66,29 +59,37 @@ class WebScraperCrewAgent:
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Remove script/style/nav/footer to reduce noise
             for tag in soup(["script", "style", "nav", "footer", "header"]):
                 tag.decompose()
 
             paragraphs = [p.get_text(" ").strip() for p in soup.find_all("p")]
             text = " ".join(p for p in paragraphs if p)
-            return text[:8000]  # truncate to avoid long inputs
+            return text[:8000]
         except Exception as exc:
             return f"Error scraping website: {exc}"
 
     def summarize_content(self, text: str, query: str, trace=None, url: str | None = None) -> str:
         system_prompt = (
             "You are a precise web analyst. Use only the provided content. "
-            "If information is missing, say so clearly. Keep answers concise."
+            "If information is missing, say so clearly. Keep answers concise but reasoning rich."
         )
 
         if CAPTURE_COT:
             user_prompt = (
-                f"Below is content scraped from a public website.\n\n"
-                f"Content:\n{text}\n\n"
-                f"User question:\n{query}\n\n"
-                "Return a compact JSON object with keys 'reasoning' and 'answer'. "
-                "Keep 'reasoning' brief and high-level; avoid sensitive data."
+                "Below is content scraped from a public website.\n\n"
+                "Content:\n"
+                f"{text}\n\n"
+                "User question:\n"
+                f"{query}\n\n"
+                "Return a JSON object with the following keys:\n"
+                "  - reasoning: a detailed, step-by-step internal chain-of-thought (several short paragraphs or numbered steps). "
+                "    This is for internal telemetry only and should not be shown to the user. Avoid copying private data.\n"
+                "  - intermediate_steps: an optional structured breakdown of reasoning steps as an array of objects, e.g.:\n"
+                '    [ {"step": 1, "thought": "Identified key topics"}, {"step": 2, "thought": "Summarized events"} ]\n'
+                "  - answer: the concise final answer to present to the user (1–3 short paragraphs).\n\n"
+                "Make 'reasoning' thorough: include the steps you took to interpret the content, how you prioritized facts, "
+                "which parts of the content you used, and any assumptions. Do NOT include credentials or PII.\n"
+                "Return only valid JSON. Keep the object compact but allow substantial detail in 'reasoning'."
             )
         else:
             user_prompt = (
@@ -98,7 +99,12 @@ class WebScraperCrewAgent:
                 "Provide a clear, factual, carefully structured answer."
             )
 
-        def _call_openai_and_parse() -> tuple[str, str | None]:
+        def _scrub_sensitive(s: str) -> str:
+            s = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]", s)
+            s = re.sub(r"\b(sk|pk)-[A-Za-z0-9_\-]+\b", "[REDACTED_KEY]", s)
+            return s
+
+        def _call_openai_and_parse() -> tuple[str, str | None, list | None]:
             if CAPTURE_COT:
                 resp = self.client.chat.completions.create(
                     model=self.model,
@@ -107,14 +113,20 @@ class WebScraperCrewAgent:
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.2,
+                    max_tokens=2000,
                     response_format={"type": "json_object"},
                 )
                 content = resp.choices[0].message.content or ""
                 try:
                     obj = json.loads(content)
-                    return str(obj.get("answer", "")), obj.get("reasoning")
+                    answer = str(obj.get("answer", ""))
+                    reasoning = obj.get("reasoning")
+                    steps = obj.get("intermediate_steps")
+                    if isinstance(reasoning, str):
+                        reasoning = _scrub_sensitive(reasoning)
+                    return answer, reasoning, steps
                 except Exception:
-                    return content, None
+                    return content, None, None
             else:
                 resp = self.client.chat.completions.create(
                     model=self.model,
@@ -123,9 +135,11 @@ class WebScraperCrewAgent:
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.2,
+                    max_tokens=800,
                 )
-                return resp.choices[0].message.content, None
+                return resp.choices[0].message.content, None, None
 
+        # --- Langfuse logging ---
         if self.langfuse and trace is not None:
             try:
                 gen = trace.generation(
@@ -136,24 +150,31 @@ class WebScraperCrewAgent:
                 )
             except Exception:
                 gen = None
-            answer, reasoning = _call_openai_and_parse()
+
+            answer, reasoning, steps = _call_openai_and_parse()
+
             if gen is not None:
-                try:
-                    gen.output = answer
-                except Exception:
-                    pass
-            if CAPTURE_COT and reasoning and trace is not None:
-                try:
-                    trace.span(name="chain_of_thought", input=None).end(output={"reasoning": reasoning})
-                except Exception:
-                    pass
+                gen.output = answer
+
+            # Log reasoning (text) and structured steps (JSON array) in separate spans
+            if CAPTURE_COT:
+                if reasoning:
+                    try:
+                        trace.span(name="chain_of_thought").end(output={"reasoning": reasoning})
+                    except Exception:
+                        pass
+                if steps:
+                    try:
+                        trace.span(name="intermediate_steps").end(output={"steps": steps})
+                    except Exception:
+                        pass
+
             return answer
         else:
-            answer, _ = _call_openai_and_parse()
+            answer, _, _ = _call_openai_and_parse()
             return answer
 
     def respond(self, user_input: str) -> Tuple[str, str, str]:
-        """Main workflow: extract URL, scrape, summarize, and log to Langfuse."""
         url = self._extract_first_url(user_input)
         if not url:
             return ("", "", "Please provide a valid website URL in your query.")
@@ -171,25 +192,19 @@ class WebScraperCrewAgent:
                 print(f"⚠️ Failed to create Langfuse trace: {e}")
                 trace = None
 
-        # Scrape website
         scraped = self.scrape_website(url)
         if trace:
             try:
-                trace.span(name="scrape_website", input={"url": url}).end(
-                    output={"characters": len(scraped)}
-                )
+                trace.span(name="scrape_website").end(output={"characters": len(scraped)})
                 print("✅ Logged scrape_website span to Langfuse")
             except Exception as e:
                 print(f"⚠️ Failed to log scrape span: {e}")
 
-        # Summarize
         summary = self.summarize_content(scraped, user_input, trace=trace, url=url)
         return (url, scraped, summary)
 
 
 # ---------------- STREAMLIT FRONTEND ----------------
-
-# st.set_page_config(page_title="CrewAI Web Scraper", page_icon="🤖", layout="wide")
 st.title("🤖 CrewAI Web Scraper & Summarizer")
 st.caption("Enter a URL and a question. The agent will scrape and summarize content.")
 
@@ -239,10 +254,9 @@ st.markdown(
     textwrap.dedent(
         """
         Tips:
-        - Provide a full URL beginning with https://
-        - Add a specific question to focus the summary
+        - Provide a full URL beginning with https://  
+        - Add a specific question to focus the summary  
         - Content is truncated to avoid exceeding token limits
         """
     )
 )
-

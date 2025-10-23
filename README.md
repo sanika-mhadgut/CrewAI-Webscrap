@@ -78,3 +78,22 @@ CrewAI-Webscrap/
 └── app/
     ├── streamlit_app.py
     └── agent.py
+
+
+## Debugging Azure web app:
+cd Desktop/CrewAI-Webscrap
+
+docker buildx build --platform linux/amd64 -t crewaiacrsm.azurecr.io/crewai-streamlit-app:v8 --push .
+
+az webapp config container set \
+  --name crewai-streamlit-app \
+  --resource-group crewai-rg \
+  --container-image-name crewaiacrsm.azurecr.io/crewai-streamlit-app:v8 \
+  --container-registry-url https://crewaiacrsm.azurecr.io \
+  --container-registry-user $(az acr credential show -n crewaiacrsm --query "username" -o tsv) \
+  --container-registry-password $(az acr credential show -n crewaiacrsm --query "passwords[0].value" -o tsv)
+
+az webapp restart --name crewai-streamlit-app --resource-group crewai-rg
+
+az webapp log tail --name crewai-streamlit-app --resource-group crewai-rg
+
